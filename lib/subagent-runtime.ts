@@ -74,6 +74,8 @@ type StoredSubagentExecution = {
   run: SubagentRunInfo;
   completion: Promise<SubagentRunInfo>;
   abortRequested: boolean;
+  /** Set once the turn limit ends the run; later steering is refused instead of starting another turn. */
+  turnLimitReached?: boolean;
   cancelQueued?: () => boolean;
 };
 
@@ -86,19 +88,29 @@ const SUBAGENT_CONTEXT_LIMIT = 50_000;
 const PARENT_IDLE_POLL_MS = 200;
 const THINKING_LEVELS = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
-/** The SDK may resolve prompt() after failure or abort. Callers handle requested cancellation separately. */
-function lastAssistantError(sessionManager: { getEntries?: () => unknown }): string | undefined {
+const TURN_LIMIT_INSTRUCTION = "You have reached your turn limit. Wrap up immediately and provide your final answer now.";
+
+/**
+ * How the last model request ended when `prompt()` resolved anyway: pi records a provider
+ * failure, or a request stopped from the child's own chat, on the assistant message.
+ */
+function lastAssistantStop(sessionManager: { getEntries?: () => unknown }): { aborted?: true; error?: string } | undefined {
   const entries = sessionManager.getEntries?.();
   if (!Array.isArray(entries)) return undefined;
   for (let i = entries.length - 1; i >= 0; i -= 1) {
     const entry = entries[i] as { type?: unknown; message?: { role?: unknown; stopReason?: unknown; errorMessage?: unknown } };
     if (entry?.type !== "message" || entry.message?.role !== "assistant") continue;
-    const reason = entry.message.stopReason;
-    if (reason !== "error" && reason !== "aborted") return undefined;
-    const fallback = reason === "aborted" ? "Subagent stopped before completion" : "Provider returned an error";
-    return typeof entry.message.errorMessage === "string" && entry.message.errorMessage ? entry.message.errorMessage : fallback;
+    if (entry.message.stopReason === "aborted") return { aborted: true };
+    if (entry.message.stopReason !== "error") return undefined;
+    return { error: typeof entry.message.errorMessage === "string" && entry.message.errorMessage ? entry.message.errorMessage : "Provider returned an error" };
   }
   return undefined;
+}
+
+function turnLimitError(turnLimit: number, undelivered: readonly string[]): string {
+  const error = `Subagent reached its turn limit (${turnLimit}) without completing the task.`;
+  if (undelivered.length === 0) return error;
+  return `${error} These queued messages were not delivered:\n${undelivered.map((text) => `- ${text}`).join("\n")}`;
 }
 
 function getSubagentRuns(): Map<string, StoredSubagentExecution> {
@@ -381,7 +393,9 @@ export function createSubagentController(
         dependencies.invalidateSessionList();
         let turnCount = 0;
         let maxTurnsReached = false;
+        let undelivered: string[] = [];
         const previousFinishTurn = inner.agent.finishTurn;
+        const previousSteeringMode = inner.agent.steeringMode;
         let unsubscribeTools: (() => void) | undefined;
         if (turnLimit) {
           // Finalized events retain the SDK's terminate hint; tool-result messages do not.
@@ -402,10 +416,18 @@ export function createSubagentController(
             if (!needsAnotherTurn || turnCount < turnLimit) return decision;
             if (turnCount >= turnLimit + 1) {
               maxTurnsReached = true;
+              stored.turnLimitReached = true;
+              // AgentSession starts another run for anything still queued, past an `end`
+              // decision, so the limit holds only once the queues are empty.
+              const { steering, followUp } = inner.clearQueue();
+              undelivered = [...undelivered, ...steering, ...followUp];
               return { action: "end" };
             }
             // The awaited SDK boundary delivers the instruction before the wrap-up request.
-            await inner.steer("You have reached your turn limit. Wrap up immediately and provide your final answer now.");
+            // In one-at-a-time mode a steer queued earlier would take the wrap-up turn and
+            // leave the instruction for later, so that turn takes everything queued.
+            inner.agent.steeringMode = "all";
+            await inner.steer(TURN_LIMIT_INSTRUCTION);
             return decision;
           };
         }
@@ -413,9 +435,10 @@ export function createSubagentController(
         try {
           await inner.prompt(delegatedTask, { source: "rpc" });
           const text = inner.getLastAssistantText()?.trim();
-          const aborted = stored.abortRequested;
-          const errorMessage = aborted ? undefined : lastAssistantError(sessionManager) ??
-            (maxTurnsReached ? `Subagent reached its turn limit (${turnLimit}) without completing the task.` : undefined);
+          const stop = stored.abortRequested ? undefined : lastAssistantStop(sessionManager);
+          const aborted = stored.abortRequested || stop?.aborted === true;
+          const errorMessage = aborted ? undefined : stop?.error ??
+            (maxTurnsReached && turnLimit ? turnLimitError(turnLimit, undelivered) : undefined);
           result = {
             ...initialRun,
             status: aborted ? "aborted" : errorMessage ? "failed" : "completed",
@@ -436,7 +459,10 @@ export function createSubagentController(
               : {}),
           };
         } finally {
-          if (turnLimit) inner.agent.finishTurn = previousFinishTurn;
+          if (turnLimit) {
+            inner.agent.finishTurn = previousFinishTurn;
+            inner.agent.steeringMode = previousSteeringMode;
+          }
           unsubscribeTools?.();
           request.signal?.removeEventListener("abort", handleParentAbort);
         }
@@ -559,10 +585,12 @@ export function createSubagentController(
       try {
         await wrapper!.inner.prompt(request.task, { source: "rpc" });
         const text = wrapper!.inner.getLastAssistantText()?.trim();
-        const providerError = stored.abortRequested ? undefined : lastAssistantError(manager);
+        const stop = stored.abortRequested ? undefined : lastAssistantStop(manager);
+        const aborted = stored.abortRequested || stop?.aborted === true;
+        const providerError = aborted ? undefined : stop?.error;
         result = {
           ...initialRun,
-          status: stored.abortRequested ? "aborted" : providerError ? "failed" : "completed",
+          status: aborted ? "aborted" : providerError ? "failed" : "completed",
           completedAt: new Date().toISOString(),
           ...(text ? { result: text } : {}),
           ...(providerError ? { error: providerError } : {}),
@@ -634,6 +662,7 @@ export function createSubagentController(
   async function steer(sessionId: string, message: string): Promise<void> {
     const wrapper = dependencies.getSession(sessionId);
     if (!wrapper?.isAlive() || !wrapper.isRunning()) throw new Error("Subagent is not running");
+    if (getSubagentRuns().get(sessionId)?.turnLimitReached) throw new Error("Subagent reached its turn limit and is stopping; resume it to continue");
     if (!message.trim()) throw new Error("Steering message is required");
     await wrapper.inner.steer(message.trim());
   }
