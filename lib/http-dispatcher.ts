@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import * as undici from "undici";
 import { readRegularFileText } from "./regular-file";
 
@@ -34,16 +35,27 @@ function parseHttpIdleTimeoutMs(value: unknown): number | undefined {
  * because this module runs in Next.js instrumentation: importing the SDK there
  * costs about a second of startup time, while `undici` costs a tenth of one.
  */
-function defaultAgentDir(): string {
-  const configured = process.env.PI_CODING_AGENT_DIR?.trim();
-  if (configured !== undefined && configured.length > 0) {
-    if (configured === "~") return homedir();
-    if (configured.startsWith("~/") || configured.startsWith("~\\")) {
-      return join(homedir(), configured.slice(2));
-    }
-    return configured;
+export function defaultAgentDir(): string {
+  let configured = process.env.PI_CODING_AGENT_DIR;
+  if (!configured) return join(homedir(), ".pi", "agent");
+
+  // pi's normalizePath(): Git Bash, MSYS, Cygwin and WSL drive paths on
+  // Windows, then `~`, then file: URLs. The value is not trimmed.
+  if (process.platform === "win32") configured = windowsShellPath(configured);
+  if (configured === "~") return homedir();
+  if (configured.startsWith("~/") || (process.platform === "win32" && configured.startsWith("~\\"))) {
+    return join(homedir(), configured.slice(2));
   }
-  return join(homedir(), ".pi", "agent");
+  if (/^file:\/\//.test(configured)) return fileURLToPath(configured);
+  return configured;
+}
+
+/** pi's normalizeWindowsShellPath(): `/c/x`, `/mnt/c/x`, `/cygdrive/c/x` to `C:\x`. */
+function windowsShellPath(path: string): string {
+  if (!path.startsWith("/") || path.startsWith("//") || path.includes("\\")) return path;
+  const match = path.match(/^\/(?:mnt\/|cygdrive\/)?([a-z])(?:\/(.*))?$/i);
+  if (!match) return path;
+  return `${match[1].toUpperCase()}:\\${match[2]?.replaceAll("/", "\\") ?? ""}`;
 }
 
 /**
